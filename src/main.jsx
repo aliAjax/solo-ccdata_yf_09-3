@@ -17,11 +17,38 @@ const seedPapers = [
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
 
 // 统一把所有 id 规范为字符串（select 值、JSON 导入、旧数据都可能是数字）
+// 同时兜底清洗字段类型，避免历史损坏数据（如 tags 含对象）导致渲染崩溃
+const asStr = (v, d = '') => (typeof v === 'string' ? v : d);
+const asTags = v => (Array.isArray(v) ? v.filter(t => typeof t === 'string') : []);
+const asYear = v => {
+  const n = typeof v === 'number' ? v : parseInt(v, 10);
+  return Number.isFinite(n) ? n : new Date().getFullYear();
+};
 const normalizeDb = db => ({
   version: VERSION,
-  papers: db.papers.map(p => ({tags: [], status: '待读', ...p, id: String(p.id)})),
-  projects: db.projects.map(p => ({question: '', ...p, id: String(p.id)})),
-  links: db.links.map(l => ({excerpt: '', note: '', ...l, id: String(l.id ?? uid()), projectId: String(l.projectId), paperId: String(l.paperId)})),
+  papers: (db.papers || []).map(p => ({
+    ...p,
+    id: String(p.id),
+    title: asStr(p.title),
+    authors: asStr(p.authors),
+    venue: asStr(p.venue),
+    abstract: asStr(p.abstract),
+    status: asStr(p.status, '待读'),
+    cite: asStr(p.cite),
+    notes: asStr(p.notes),
+    year: asYear(p.year),
+    tags: asTags(p.tags),
+  })),
+  projects: (db.projects || []).map(p => ({...p, id: String(p.id), name: asStr(p.name), question: asStr(p.question)})),
+  links: (db.links || []).map(l => ({
+    ...l,
+    id: String(l.id ?? uid()),
+    projectId: String(l.projectId),
+    paperId: String(l.paperId),
+    stance: STANCES.includes(l.stance) ? l.stance : '存疑',
+    excerpt: asStr(l.excerpt),
+    note: asStr(l.note),
+  })),
 });
 
 function loadDb() {
@@ -37,7 +64,8 @@ function loadDb() {
   return normalizeDb({papers: seedPapers, projects: [], links: []});
 }
 
-// 导入校验：版本、字段、重复数据全部通过才返回 db，任何失败都不触碰本地数据
+// 导入校验：版本、字段类型、重复数据全部通过才返回 db，任何失败都不触碰本地数据
+const isOptStr = v => v == null || typeof v === 'string';
 function validateImport(data) {
   const err = error => ({ok: false, error});
   if (!data || typeof data !== 'object' || Array.isArray(data)) return err('文件不是有效的 JSON 对象');
@@ -51,7 +79,9 @@ function validateImport(data) {
     if (p.id == null || typeof p.title !== 'string' || !p.title.trim()) return err(`第 ${i + 1} 篇文献缺少 id 或 title 字段`);
     if (paperIds.has(String(p.id))) return err(`文献 id 重复：${String(p.id)}`);
     paperIds.add(String(p.id));
-    if (p.tags != null && !Array.isArray(p.tags)) return err(`文献「${p.title}」的 tags 必须是数组`);
+    if (p.tags != null && (!Array.isArray(p.tags) || p.tags.some(t => typeof t !== 'string'))) return err(`文献「${p.title}」的 tags 必须是字符串数组`);
+    if (![p.authors, p.venue, p.abstract, p.status, p.cite, p.notes].every(isOptStr)) return err(`文献「${p.title}」存在类型错误的字段（作者/出版物/摘要/状态/引用/笔记应为字符串）`);
+    if (p.year != null && !(typeof p.year === 'number' && Number.isFinite(p.year)) && !(typeof p.year === 'string' && p.year.trim() !== '' && !isNaN(+p.year))) return err(`文献「${p.title}」的 year 必须是数字`);
   }
   const projectIds = new Set();
   for (const [i, p] of projects.entries()) {
@@ -59,13 +89,21 @@ function validateImport(data) {
     if (p.id == null || typeof p.name !== 'string' || !p.name.trim()) return err(`第 ${i + 1} 个项目缺少 id 或 name 字段`);
     if (projectIds.has(String(p.id))) return err(`项目 id 重复：${String(p.id)}`);
     projectIds.add(String(p.id));
+    if (!isOptStr(p.question)) return err(`项目「${p.name}」的 question 必须是字符串`);
   }
   const pairSet = new Set();
+  const linkIds = new Set();
   for (const [i, l] of links.entries()) {
     if (!l || typeof l !== 'object') return err(`第 ${i + 1} 条关联不是对象`);
     if (!projectIds.has(String(l.projectId))) return err(`第 ${i + 1} 条关联引用了不存在的项目：${String(l.projectId)}`);
     if (!paperIds.has(String(l.paperId))) return err(`第 ${i + 1} 条关联引用了不存在的文献：${String(l.paperId)}`);
     if (!STANCES.includes(l.stance)) return err(`第 ${i + 1} 条关联立场无效：${String(l.stance)}（应为 ${STANCES.join('/')}）`);
+    if (!isOptStr(l.excerpt) || !isOptStr(l.note)) return err(`第 ${i + 1} 条关联的 excerpt/note 必须是字符串`);
+    if (l.id != null) {
+      const lid = String(l.id);
+      if (linkIds.has(lid)) return err(`关联 id 重复：${lid}`);
+      linkIds.add(lid);
+    }
     const key = `${l.projectId}::${l.paperId}`;
     if (pairSet.has(key)) return err(`重复关联：项目 ${String(l.projectId)} 与文献 ${String(l.paperId)}`);
     pairSet.add(key);
@@ -122,6 +160,17 @@ function App() {
     setUndoStack(s => [...s.slice(-49), {label, state: db}]);
     setDb(next);
     notify(label);
+  };
+  // 文本类连续编辑（如笔记逐字输入）用相同 key 合并为一条撤销记录：
+  // 栈顶 key 相同则只更新数据、保留最初快照，撤销时一次回到本次编辑前
+  const commitCoalesced = (next, label, key) => {
+    const top = undoStack[undoStack.length - 1];
+    if (top && top.key === key) {
+      setDb(next);
+    } else {
+      setUndoStack(s => [...s.slice(-49), {label, state: db, key}]);
+      setDb(next);
+    }
   };
   const undo = () => {
     const last = undoStack[undoStack.length - 1];
@@ -180,7 +229,8 @@ function App() {
   }, [aId, bId, linksByProject, papersById]);
 
   // ---------- 文献库操作 ----------
-  const updatePaper = (id, k, v) => setDb({...db, papers: db.papers.map(x => x.id === id ? {...x, [k]: v} : x)});
+  // 笔记等文本编辑走可合并的撤销：连续输入只产生一条撤销记录
+  const updatePaper = (id, k, v) => commitCoalesced({...db, papers: db.papers.map(x => x.id === id ? {...x, [k]: v} : x)}, '编辑文献笔记', `paper:${id}:${k}`);
   const addPaper = () => {
     if (!paperForm.title.trim()) return;
     const p = {
