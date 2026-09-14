@@ -16,14 +16,30 @@ const seedPapers = [
 
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : `id-${Date.now()}-${Math.floor(Math.random() * 1e6)}`);
 
+// 标识只接受非空字符串或有限数值（拒绝对象、布尔、NaN、Infinity、空白串）
+const isValidId = v =>
+  (typeof v === 'string' && v.trim() !== '') ||
+  (typeof v === 'number' && Number.isFinite(v));
+
+// 年份必须能完整解释为整数：数字须为整数；字符串须为纯整数形式（拒绝 2.026e3、2026.5 等）
+// 返回 null 表示无法完整解释，调用方应拒绝而非截断
+const parseYear = v => {
+  if (typeof v === 'number') return Number.isInteger(v) ? v : null;
+  if (typeof v === 'string') {
+    const t = v.trim();
+    if (/^[+-]?\d+$/.test(t)) {
+      const n = parseInt(t, 10);
+      if (Number.isSafeInteger(n)) return n;
+    }
+  }
+  return null;
+};
+
 // 统一把所有 id 规范为字符串（select 值、JSON 导入、旧数据都可能是数字）
 // 同时兜底清洗字段类型，避免历史损坏数据（如 tags 含对象）导致渲染崩溃
 const asStr = (v, d = '') => (typeof v === 'string' ? v : d);
 const asTags = v => (Array.isArray(v) ? v.filter(t => typeof t === 'string') : []);
-const asYear = v => {
-  const n = typeof v === 'number' ? v : parseInt(v, 10);
-  return Number.isFinite(n) ? n : new Date().getFullYear();
-};
+const asYear = v => parseYear(v) ?? new Date().getFullYear();
 const normalizeDb = db => ({
   version: VERSION,
   papers: (db.papers || []).map(p => ({
@@ -76,17 +92,19 @@ function validateImport(data) {
   const paperIds = new Set();
   for (const [i, p] of papers.entries()) {
     if (!p || typeof p !== 'object') return err(`第 ${i + 1} 篇文献不是对象`);
-    if (p.id == null || typeof p.title !== 'string' || !p.title.trim()) return err(`第 ${i + 1} 篇文献缺少 id 或 title 字段`);
+    if (!isValidId(p.id)) return err(`第 ${i + 1} 篇文献的 id 必须是非空字符串或有限数值`);
+    if (typeof p.title !== 'string' || !p.title.trim()) return err(`第 ${i + 1} 篇文献缺少 title 字段`);
     if (paperIds.has(String(p.id))) return err(`文献 id 重复：${String(p.id)}`);
     paperIds.add(String(p.id));
     if (p.tags != null && (!Array.isArray(p.tags) || p.tags.some(t => typeof t !== 'string'))) return err(`文献「${p.title}」的 tags 必须是字符串数组`);
     if (![p.authors, p.venue, p.abstract, p.status, p.cite, p.notes].every(isOptStr)) return err(`文献「${p.title}」存在类型错误的字段（作者/出版物/摘要/状态/引用/笔记应为字符串）`);
-    if (p.year != null && !(typeof p.year === 'number' && Number.isFinite(p.year)) && !(typeof p.year === 'string' && p.year.trim() !== '' && !isNaN(+p.year))) return err(`文献「${p.title}」的 year 必须是数字`);
+    if (p.year != null && parseYear(p.year) === null) return err(`文献「${p.title}」的 year 无法完整解释为整数年份：${JSON.stringify(p.year)}`);
   }
   const projectIds = new Set();
   for (const [i, p] of projects.entries()) {
     if (!p || typeof p !== 'object') return err(`第 ${i + 1} 个项目不是对象`);
-    if (p.id == null || typeof p.name !== 'string' || !p.name.trim()) return err(`第 ${i + 1} 个项目缺少 id 或 name 字段`);
+    if (!isValidId(p.id)) return err(`第 ${i + 1} 个项目的 id 必须是非空字符串或有限数值`);
+    if (typeof p.name !== 'string' || !p.name.trim()) return err(`第 ${i + 1} 个项目缺少 name 字段`);
     if (projectIds.has(String(p.id))) return err(`项目 id 重复：${String(p.id)}`);
     projectIds.add(String(p.id));
     if (!isOptStr(p.question)) return err(`项目「${p.name}」的 question 必须是字符串`);
@@ -95,6 +113,8 @@ function validateImport(data) {
   const linkIds = new Set();
   for (const [i, l] of links.entries()) {
     if (!l || typeof l !== 'object') return err(`第 ${i + 1} 条关联不是对象`);
+    if (l.id != null && !isValidId(l.id)) return err(`第 ${i + 1} 条关联的 id 必须是非空字符串或有限数值`);
+    if (!isValidId(l.projectId) || !isValidId(l.paperId)) return err(`第 ${i + 1} 条关联的引用标识必须是非空字符串或有限数值`);
     if (!projectIds.has(String(l.projectId))) return err(`第 ${i + 1} 条关联引用了不存在的项目：${String(l.projectId)}`);
     if (!paperIds.has(String(l.paperId))) return err(`第 ${i + 1} 条关联引用了不存在的文献：${String(l.paperId)}`);
     if (!STANCES.includes(l.stance)) return err(`第 ${i + 1} 条关联立场无效：${String(l.stance)}（应为 ${STANCES.join('/')}）`);
